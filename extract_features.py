@@ -108,7 +108,8 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
         for img_file in batch_files:
             img_path = os.path.join(image_dir, img_file)
             img = Image.open(img_path).convert('RGB')
-            img = img.resize((224, 224))
+            # Don't resize - keep original size to match on-the-fly mode (typically ~425x425 -> 31x31 patches)
+            # img = img.resize((224, 224))
             img_tensor = normalize(img)
             
             # DINOv2用のパディング (datasets/nsd.pyと同じ処理)
@@ -248,7 +249,8 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
         for img_file in batch_files:
             img_path = os.path.join(image_dir, img_file)
             img = Image.open(img_path).convert('RGB')
-            img = img.resize((224, 224))
+            # Don't resize - keep original size to match on-the-fly mode (typically ~425x425 -> 31x31 patches)
+            # img = img.resize((224, 224))
             img_tensor = normalize(img)
             
             # パディング
@@ -370,6 +372,7 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
         for img_file in batch_files:
             img_path = os.path.join(image_dir, img_file)
             img = Image.open(img_path).convert('RGB')
+            # CLIP ViT-L-14 expects 224x224 images (16x16 patches = 256 + 1 CLS = 257 tokens)
             img = img.resize((224, 224))
             img_tensor = normalize(img)
             batch_imgs.append(img_tensor)
