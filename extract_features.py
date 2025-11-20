@@ -145,10 +145,7 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
             
             # Reshape (models/dino.py の58-62行目と同じ)
             nh = 12  # Number of heads
-            # feats shape: [batch, num_tokens, 3*nh*head_dim]
-            # Calculate head_dim: qkv_dim / (3 * nh)
-            head_dim = feats.shape[-1] // (3 * nh)
-            feats = feats.reshape(xs.shape[0], xs.shape[1]+1, 3, nh, head_dim).permute(2, 0, 3, 1, 4)
+            feats = feats.reshape(xs.shape[0], xs.shape[1]+1, 3, nh, -1 // nh).permute(2, 0, 3, 1, 4)
             q, k, v = feats[0], feats[1], feats[2]
             q = q.transpose(1, 2).reshape(xs.shape[0], xs.shape[1]+1, -1)
             
