@@ -91,7 +91,9 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
     feature_dim = 768
     
     # 出力ディレクトリを作成
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # メモリマップ配列を作成（メモリ最適化）
     memmap_features = np.memmap(output_path + '.tmp', dtype='float32', mode='w+', 
@@ -226,7 +228,9 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
     feature_dim = 768
     
     # 出力ディレクトリを作成
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # メモリマップ配列を作成（メモリ最適化）
     memmap_features = np.memmap(output_path + '.tmp', dtype='float32', mode='w+', 
@@ -346,7 +350,9 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
     feature_dim = 768
     
     # 出力ディレクトリを作成
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     
     # メモリマップ配列を作成（メモリ最適化）
     memmap_features = np.memmap(output_path + '.tmp', dtype='float32', mode='w+', 
