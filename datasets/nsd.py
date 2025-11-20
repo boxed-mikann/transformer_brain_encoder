@@ -34,8 +34,11 @@ class algonauts_dataset(Dataset):
         if is_train == 'train':
             
             if self.saved_feats: 
-                fts_subj_train = np.load(dino_feat_dir + '/train.npy')
-                clip_subj_train = np.load(clip_feat_dir + '/train.npy')
+                # メモリマップモードで読み込み（メモリ最適化）
+                # mmap_mode='r' を使用して、必要な分だけメモリに読み込む
+                fts_subj_train = np.load(dino_feat_dir + '/train.npy', mmap_mode='r')
+                clip_subj_train = np.load(clip_feat_dir + '/train.npy', mmap_mode='r')
+                # インデックスでスライスしても、memmapは必要な部分のみメモリに読み込む
                 self.fts_subj_train = fts_subj_train[idxs] 
                 self.clip_subj_train = clip_subj_train[idxs]
             
@@ -47,8 +50,9 @@ class algonauts_dataset(Dataset):
             
         elif is_train == 'test':
             if self.saved_feats: 
-                self.fts_subj_test = np.load(dino_feat_dir + '/synt.npy')
-                self.clip_subj_test = np.load(clip_feat_dir + '/synt.npy')
+                # メモリマップモードで読み込み（メモリ最適化）
+                self.fts_subj_test = np.load(dino_feat_dir + '/synt.npy', mmap_mode='r')
+                self.clip_subj_test = np.load(clip_feat_dir + '/synt.npy', mmap_mode='r')
         
         self.length = len(idxs)
 
