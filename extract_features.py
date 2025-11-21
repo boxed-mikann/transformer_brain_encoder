@@ -168,15 +168,27 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
         if device == 'cuda':
             torch.cuda.empty_cache()
     
-    # メモリマップをフラッシュ
+    # メモリマップをフラッシュして閉じる
     memmap_features.flush()
     
     print(f"✅ Feature shape: {memmap_features.shape}")
     
-    # 一時ファイルを最終ファイルに移動
+    # メモリマップを明示的に削除してファイルを閉じる
+    del memmap_features
+    
+    # 一時ファイルを読み込んで.npy形式で保存
     import shutil
-    shutil.move(output_path + '.tmp', output_path)
+    import os
+    temp_data = np.load(output_path + '.tmp', mmap_mode='r')
+    np.save(output_path, temp_data)
+    
+    # 一時ファイルを削除
+    os.remove(output_path + '.tmp')
+    
+    # ファイルサイズを表示
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Saved to {output_path}")
+    print(f"   File size: {file_size_mb:.2f} MB")
     
     # 保存された特徴量を返す（互換性のため）
     all_features = np.load(output_path, mmap_mode='r')
@@ -293,15 +305,27 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
         if device == 'cuda':
             torch.cuda.empty_cache()
     
-    # メモリマップをフラッシュ
+    # メモリマップをフラッシュして閉じる
     memmap_features.flush()
     
     print(f"✅ Feature shape: {memmap_features.shape}")
     
-    # 一時ファイルを最終ファイルに移動
+    # メモリマップを明示的に削除してファイルを閉じる
+    del memmap_features
+    
+    # 一時ファイルを読み込んで.npy形式で保存
     import shutil
-    shutil.move(output_path + '.tmp', output_path)
+    import os
+    temp_data = np.load(output_path + '.tmp', mmap_mode='r')
+    np.save(output_path, temp_data)
+    
+    # 一時ファイルを削除
+    os.remove(output_path + '.tmp')
+    
+    # ファイルサイズを表示
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Saved to {output_path}")
+    print(f"   File size: {file_size_mb:.2f} MB")
     
     # 保存された特徴量を返す（互換性のため）
     all_features = np.load(output_path, mmap_mode='r')
@@ -401,15 +425,27 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
         if device == 'cuda':
             torch.cuda.empty_cache()
     
-    # メモリマップをフラッシュ
+    # メモリマップをフラッシュして閉じる
     memmap_features.flush()
     
     print(f"✅ Feature shape: {memmap_features.shape}")
     
-    # 一時ファイルを最終ファイルに移動
+    # メモリマップを明示的に削除してファイルを閉じる
+    del memmap_features
+    
+    # 一時ファイルを読み込んで.npy形式で保存
     import shutil
-    shutil.move(output_path + '.tmp', output_path)
+    import os
+    temp_data = np.load(output_path + '.tmp', mmap_mode='r')
+    np.save(output_path, temp_data)
+    
+    # 一時ファイルを削除
+    os.remove(output_path + '.tmp')
+    
+    # ファイルサイズを表示
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Saved to {output_path}")
+    print(f"   File size: {file_size_mb:.2f} MB")
     
     # 保存された特徴量を返す（互換性のため）
     all_features = np.load(output_path, mmap_mode='r')
