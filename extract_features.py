@@ -31,6 +31,7 @@ This script pre-extracts image features and saves them for later use.
 """
 
 import os
+import shutil
 import torch
 import numpy as np
 from pathlib import Path
@@ -44,10 +45,67 @@ from models.clip import clip_model
 from utils.utils import NestedTensor
 
 
+def save_memmap_as_npy(memmap_path, output_path, shape, dtype='float32'):
+    """
+    メモリマップファイルを.npy形式で保存する（メモリ効率的）
+    
+    np.save()はデータを全てメモリに読み込むため、大きなファイルでは
+    メモリ不足になる。この関数は.npyヘッダーを手動で書き込み、
+    生のバイナリデータをコピーすることでメモリ使用を最小化する。
+    
+    Args:
+        memmap_path: 入力memmapファイルのパス
+        output_path: 出力.npyファイルのパス
+        shape: データの形状 (tuple)
+        dtype: データ型 (default: 'float32')
+    """
+    # .npyファイルヘッダーを構築
+    # NumPy format specification: https://numpy.org/devdocs/reference/generated/numpy.lib.format.html
+    dtype_obj = np.dtype(dtype)
+    header_dict = {
+        'descr': dtype_obj.str,
+        'fortran_order': False,
+        'shape': shape,
+    }
+    header = repr(header_dict)
+    # パディングを追加して64バイトアライメントにする
+    # マジックナンバー(6) + バージョン(2) + ヘッダー長(2) + ヘッダー = 64の倍数
+    header_len = len(header) + 1  # +1 for newline
+    pad_len = 64 - ((10 + header_len) % 64)
+    if pad_len == 64:
+        pad_len = 0
+    header = header + ' ' * pad_len + '\n'
+    
+    # ファイルに書き込み
+    with open(output_path, 'wb') as f:
+        # マジックナンバー
+        f.write(b'\x93NUMPY')
+        # バージョン (1.0)
+        f.write(b'\x01\x00')
+        # ヘッダー長 (little-endian unsigned short)
+        header_bytes = header.encode('latin1')
+        f.write(np.array(len(header_bytes), dtype='<u2').tobytes())
+        # ヘッダー
+        f.write(header_bytes)
+        
+        # 生データをチャンクでコピー（メモリ効率的）
+        chunk_size = 64 * 1024 * 1024  # 64MB chunks
+        with open(memmap_path, 'rb') as src:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
 def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1, batch_size=16, device='cuda'):
     """
-    DINOv2 with hooks を使った特徴抽出
+    DINOv2 with hooks を使った特徴抽出（メモリ最適化版）
     QKV特徴量を抽出し、datasets/nsd.pyと互換性のある形式で保存
+    
+    メモリ最適化:
+    - numpy.memmapを使用して特徴量を段階的に書き込む
+    - バッチ処理後にtorch.cuda.empty_cache()を呼び出してGPUメモリを解放
     
     Args:
         image_dir: 画像ディレクトリパス
@@ -71,7 +129,8 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
     
     # 画像ファイル一覧
     img_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
-    print(f"Found {len(img_files)} images")
+    num_images = len(img_files)
+    print(f"Found {num_images} images")
     
     # 正規化 (datasets/nsd.pyと同じ)
     normalize = transforms.Compose([
@@ -79,10 +138,23 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    all_features = []
     patch_size = 14
     
+    # 特徴量の形状を決定 (DINOv2: 962パッチ + 768次元)
+    num_patches = 962  # 31*31 + 1 CLS token
+    feature_dim = 768
+    
+    # 出力ディレクトリを作成
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # メモリマップ配列を作成（メモリ最適化）
+    memmap_features = np.memmap(output_path + '.tmp', dtype='float32', mode='w+', 
+                                shape=(num_images, num_patches, feature_dim))
+    
     # バッチ処理で特徴抽出
+    current_idx = 0
     for i in tqdm(range(0, len(img_files), batch_size), desc="Extracting features"):
         batch_files = img_files[i:i+batch_size]
         batch_imgs = []
@@ -90,7 +162,8 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
         for img_file in batch_files:
             img_path = os.path.join(image_dir, img_file)
             img = Image.open(img_path).convert('RGB')
-            img = img.resize((224, 224))
+            # Don't resize - keep original size to match on-the-fly mode (typically ~425x425 -> 31x31 patches)
+            # img = img.resize((224, 224))
             img_tensor = normalize(img)
             
             # DINOv2用のパディング (datasets/nsd.pyと同じ処理)
@@ -140,23 +213,50 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
             
             feats_np = feats_with_cls.cpu().numpy()
         
-        all_features.append(feats_np)
+        # メモリマップに直接書き込み（メモリ最適化）
+        batch_size_actual = len(batch_files)
+        memmap_features[current_idx:current_idx+batch_size_actual] = feats_np
+        current_idx += batch_size_actual
+        
+        # GPUメモリを解放（メモリ最適化）
+        if device == 'cuda':
+            torch.cuda.empty_cache()
     
-    # すべての特徴を結合
-    all_features = np.concatenate(all_features, axis=0)
-    print(f"✅ Feature shape: {all_features.shape}")
+    # メモリマップをフラッシュして閉じる
+    memmap_features.flush()
     
-    # 保存
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    np.save(output_path, all_features)
+    print(f"✅ Feature shape: {memmap_features.shape}")
+    
+    # メモリマップの形状を保存
+    memmap_shape = memmap_features.shape
+    
+    # メモリマップを明示的に削除してファイルを閉じる
+    del memmap_features
+    
+    # メモリ効率的に.npy形式で保存（データ全体をメモリに読み込まない）
+    print("💾 Converting to .npy format (memory-efficient)...")
+    save_memmap_as_npy(output_path + '.tmp', output_path, memmap_shape, dtype='float32')
+    
+    # 一時ファイルを削除
+    os.remove(output_path + '.tmp')
+    
+    # ファイルサイズを表示
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Saved to {output_path}")
+    print(f"   File size: {file_size_mb:.2f} MB")
     
+    # 保存された特徴量を返す（互換性のため）
+    all_features = np.load(output_path, mmap_mode='r')
     return all_features
 
 
 def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, batch_size=16, device='cuda'):
     """
-    通常の DINO を使った特徴抽出
+    通常の DINO を使った特徴抽出（メモリ最適化版）
+    
+    メモリ最適化:
+    - numpy.memmapを使用して特徴量を段階的に書き込む
+    - バッチ処理後にtorch.cuda.empty_cache()を呼び出してGPUメモリを解放
     
     Args:
         image_dir: 画像ディレクトリパス
@@ -180,7 +280,8 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
     
     # 画像ファイル一覧
     img_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
-    print(f"Found {len(img_files)} images")
+    num_images = len(img_files)
+    print(f"Found {num_images} images")
     
     # 正規化
     normalize = transforms.Compose([
@@ -188,10 +289,23 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    all_features = []
     patch_size = 14
     
+    # 特徴量の形状を決定 (DINOv2: 962パッチ + 768次元)
+    num_patches = 962  # 31*31 + 1 CLS token
+    feature_dim = 768
+    
+    # 出力ディレクトリを作成
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # メモリマップ配列を作成（メモリ最適化）
+    memmap_features = np.memmap(output_path + '.tmp', dtype='float32', mode='w+', 
+                                shape=(num_images, num_patches, feature_dim))
+    
     # バッチ処理で特徴抽出
+    current_idx = 0
     for i in tqdm(range(0, len(img_files), batch_size), desc="Extracting features"):
         batch_files = img_files[i:i+batch_size]
         batch_imgs = []
@@ -199,7 +313,8 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
         for img_file in batch_files:
             img_path = os.path.join(image_dir, img_file)
             img = Image.open(img_path).convert('RGB')
-            img = img.resize((224, 224))
+            # Don't resize - keep original size to match on-the-fly mode (typically ~425x425 -> 31x31 patches)
+            # img = img.resize((224, 224))
             img_tensor = normalize(img)
             
             # パディング
@@ -236,23 +351,50 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
             # datasets/nsd.pyがreshapeに使用する
             feats_np = xs_layer.cpu().numpy()
         
-        all_features.append(feats_np)
+        # メモリマップに直接書き込み（メモリ最適化）
+        batch_size_actual = len(batch_files)
+        memmap_features[current_idx:current_idx+batch_size_actual] = feats_np
+        current_idx += batch_size_actual
+        
+        # GPUメモリを解放（メモリ最適化）
+        if device == 'cuda':
+            torch.cuda.empty_cache()
     
-    # すべての特徴を結合
-    all_features = np.concatenate(all_features, axis=0)
-    print(f"✅ Feature shape: {all_features.shape}")
+    # メモリマップをフラッシュして閉じる
+    memmap_features.flush()
     
-    # 保存
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    np.save(output_path, all_features)
+    print(f"✅ Feature shape: {memmap_features.shape}")
+    
+    # メモリマップの形状を保存
+    memmap_shape = memmap_features.shape
+    
+    # メモリマップを明示的に削除してファイルを閉じる
+    del memmap_features
+    
+    # メモリ効率的に.npy形式で保存（データ全体をメモリに読み込まない）
+    print("💾 Converting to .npy format (memory-efficient)...")
+    save_memmap_as_npy(output_path + '.tmp', output_path, memmap_shape, dtype='float32')
+    
+    # 一時ファイルを削除
+    os.remove(output_path + '.tmp')
+    
+    # ファイルサイズを表示
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Saved to {output_path}")
+    print(f"   File size: {file_size_mb:.2f} MB")
     
+    # 保存された特徴量を返す（互換性のため）
+    all_features = np.load(output_path, mmap_mode='r')
     return all_features
 
 
 def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_size=16, device='cuda'):
     """
-    CLIP を使った特徴抽出
+    CLIP を使った特徴抽出（メモリ最適化版）
+    
+    メモリ最適化:
+    - numpy.memmapを使用して特徴量を段階的に書き込む
+    - バッチ処理後にtorch.cuda.empty_cache()を呼び出してGPUメモリを解放
     
     Args:
         image_dir: 画像ディレクトリパス
@@ -276,7 +418,8 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
     
     # 画像ファイル一覧
     img_files = sorted([f for f in os.listdir(image_dir) if f.endswith('.png')])
-    print(f"Found {len(img_files)} images")
+    num_images = len(img_files)
+    print(f"Found {num_images} images")
     
     # 正規化
     normalize = transforms.Compose([
@@ -284,9 +427,21 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
     
-    all_features = []
+    # 特徴量の形状を決定 (CLIP: 257パッチ + 768次元)
+    num_patches = 257  # 16*16 + 1 CLS token
+    feature_dim = 768
+    
+    # 出力ディレクトリを作成
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    
+    # メモリマップ配列を作成（メモリ最適化）
+    memmap_features = np.memmap(output_path + '.tmp', dtype='float32', mode='w+', 
+                                shape=(num_images, num_patches, feature_dim))
     
     # バッチ処理で特徴抽出
+    current_idx = 0
     for i in tqdm(range(0, len(img_files), batch_size), desc="Extracting features"):
         batch_files = img_files[i:i+batch_size]
         batch_imgs = []
@@ -294,6 +449,7 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
         for img_file in batch_files:
             img_path = os.path.join(image_dir, img_file)
             img = Image.open(img_path).convert('RGB')
+            # CLIP ViT-L-14 expects 224x224 images (16x16 patches = 256 + 1 CLS = 257 tokens)
             img = img.resize((224, 224))
             img_tensor = normalize(img)
             batch_imgs.append(img_tensor)
@@ -316,17 +472,40 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
             
             feats_np = full_tokens.cpu().numpy()
         
-        all_features.append(feats_np)
+        # メモリマップに直接書き込み（メモリ最適化）
+        batch_size_actual = len(batch_files)
+        memmap_features[current_idx:current_idx+batch_size_actual] = feats_np
+        current_idx += batch_size_actual
+        
+        # GPUメモリを解放（メモリ最適化）
+        if device == 'cuda':
+            torch.cuda.empty_cache()
     
-    # すべての特徴を結合
-    all_features = np.concatenate(all_features, axis=0)
-    print(f"✅ Feature shape: {all_features.shape}")
+    # メモリマップをフラッシュして閉じる
+    memmap_features.flush()
     
-    # 保存
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    np.save(output_path, all_features)
+    print(f"✅ Feature shape: {memmap_features.shape}")
+    
+    # メモリマップの形状を保存
+    memmap_shape = memmap_features.shape
+    
+    # メモリマップを明示的に削除してファイルを閉じる
+    del memmap_features
+    
+    # メモリ効率的に.npy形式で保存（データ全体をメモリに読み込まない）
+    print("💾 Converting to .npy format (memory-efficient)...")
+    save_memmap_as_npy(output_path + '.tmp', output_path, memmap_shape, dtype='float32')
+    
+    # 一時ファイルを削除
+    os.remove(output_path + '.tmp')
+    
+    # ファイルサイズを表示
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Saved to {output_path}")
+    print(f"   File size: {file_size_mb:.2f} MB")
     
+    # 保存された特徴量を返す（互換性のため）
+    all_features = np.load(output_path, mmap_mode='r')
     return all_features
 
 
