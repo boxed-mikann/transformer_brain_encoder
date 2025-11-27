@@ -31,6 +31,7 @@ This script pre-extracts image features and saves them for later use.
 """
 
 import os
+import shutil
 import torch
 import numpy as np
 from pathlib import Path
@@ -42,6 +43,59 @@ import argparse
 from models.dino import dino_model_with_hooks, dino_model
 from models.clip import clip_model
 from utils.utils import NestedTensor
+
+
+def save_memmap_as_npy(memmap_path, output_path, shape, dtype='float32'):
+    """
+    メモリマップファイルを.npy形式で保存する（メモリ効率的）
+    
+    np.save()はデータを全てメモリに読み込むため、大きなファイルでは
+    メモリ不足になる。この関数は.npyヘッダーを手動で書き込み、
+    生のバイナリデータをコピーすることでメモリ使用を最小化する。
+    
+    Args:
+        memmap_path: 入力memmapファイルのパス
+        output_path: 出力.npyファイルのパス
+        shape: データの形状 (tuple)
+        dtype: データ型 (default: 'float32')
+    """
+    # .npyファイルヘッダーを構築
+    # NumPy format specification: https://numpy.org/devdocs/reference/generated/numpy.lib.format.html
+    dtype_obj = np.dtype(dtype)
+    header_dict = {
+        'descr': dtype_obj.str,
+        'fortran_order': False,
+        'shape': shape,
+    }
+    header = repr(header_dict)
+    # パディングを追加して64バイトアライメントにする
+    # マジックナンバー(6) + バージョン(2) + ヘッダー長(2) + ヘッダー = 64の倍数
+    header_len = len(header) + 1  # +1 for newline
+    pad_len = 64 - ((10 + header_len) % 64)
+    if pad_len == 64:
+        pad_len = 0
+    header = header + ' ' * pad_len + '\n'
+    
+    # ファイルに書き込み
+    with open(output_path, 'wb') as f:
+        # マジックナンバー
+        f.write(b'\x93NUMPY')
+        # バージョン (1.0)
+        f.write(b'\x01\x00')
+        # ヘッダー長 (little-endian unsigned short)
+        header_bytes = header.encode('latin1')
+        f.write(np.array(len(header_bytes), dtype='<u2').tobytes())
+        # ヘッダー
+        f.write(header_bytes)
+        
+        # 生データをチャンクでコピー（メモリ効率的）
+        chunk_size = 64 * 1024 * 1024  # 64MB chunks
+        with open(memmap_path, 'rb') as src:
+            while True:
+                chunk = src.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
 
 
 def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1, batch_size=16, device='cuda'):
@@ -179,12 +233,11 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
     # メモリマップを明示的に削除してファイルを閉じる
     del memmap_features
     
-    # 一時ファイルをmemmapとして再度開いて.npy形式で保存
-    temp_data = np.memmap(output_path + '.tmp', dtype='float32', mode='r', shape=memmap_shape)
-    np.save(output_path, np.array(temp_data))
+    # メモリ効率的に.npy形式で保存（データ全体をメモリに読み込まない）
+    print("💾 Converting to .npy format (memory-efficient)...")
+    save_memmap_as_npy(output_path + '.tmp', output_path, memmap_shape, dtype='float32')
     
-    # memmapを閉じてから一時ファイルを削除
-    del temp_data
+    # 一時ファイルを削除
     os.remove(output_path + '.tmp')
     
     # ファイルサイズを表示
@@ -318,12 +371,11 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
     # メモリマップを明示的に削除してファイルを閉じる
     del memmap_features
     
-    # 一時ファイルをmemmapとして再度開いて.npy形式で保存
-    temp_data = np.memmap(output_path + '.tmp', dtype='float32', mode='r', shape=memmap_shape)
-    np.save(output_path, np.array(temp_data))
+    # メモリ効率的に.npy形式で保存（データ全体をメモリに読み込まない）
+    print("💾 Converting to .npy format (memory-efficient)...")
+    save_memmap_as_npy(output_path + '.tmp', output_path, memmap_shape, dtype='float32')
     
-    # memmapを閉じてから一時ファイルを削除
-    del temp_data
+    # 一時ファイルを削除
     os.remove(output_path + '.tmp')
     
     # ファイルサイズを表示
@@ -440,12 +492,11 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
     # メモリマップを明示的に削除してファイルを閉じる
     del memmap_features
     
-    # 一時ファイルをmemmapとして再度開いて.npy形式で保存
-    temp_data = np.memmap(output_path + '.tmp', dtype='float32', mode='r', shape=memmap_shape)
-    np.save(output_path, np.array(temp_data))
+    # メモリ効率的に.npy形式で保存（データ全体をメモリに読み込まない）
+    print("💾 Converting to .npy format (memory-efficient)...")
+    save_memmap_as_npy(output_path + '.tmp', output_path, memmap_shape, dtype='float32')
     
-    # memmapを閉じてから一時ファイルを削除
-    del temp_data
+    # 一時ファイルを削除
     os.remove(output_path + '.tmp')
     
     # ファイルサイズを表示
