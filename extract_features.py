@@ -173,16 +173,18 @@ def extract_dino_features_with_hooks(image_dir, output_path, enc_output_layer=-1
     
     print(f"✅ Feature shape: {memmap_features.shape}")
     
+    # メモリマップの形状を保存
+    memmap_shape = memmap_features.shape
+    
     # メモリマップを明示的に削除してファイルを閉じる
     del memmap_features
     
-    # 一時ファイルを読み込んで.npy形式で保存
-    import shutil
-    import os
-    temp_data = np.load(output_path + '.tmp', mmap_mode='r')
-    np.save(output_path, temp_data)
+    # 一時ファイルをmemmapとして再度開いて.npy形式で保存
+    temp_data = np.memmap(output_path + '.tmp', dtype='float32', mode='r', shape=memmap_shape)
+    np.save(output_path, np.array(temp_data))
     
-    # 一時ファイルを削除
+    # memmapを閉じてから一時ファイルを削除
+    del temp_data
     os.remove(output_path + '.tmp')
     
     # ファイルサイズを表示
@@ -310,16 +312,18 @@ def extract_dino_features_simple(image_dir, output_path, enc_output_layer=-1, ba
     
     print(f"✅ Feature shape: {memmap_features.shape}")
     
+    # メモリマップの形状を保存
+    memmap_shape = memmap_features.shape
+    
     # メモリマップを明示的に削除してファイルを閉じる
     del memmap_features
     
-    # 一時ファイルを読み込んで.npy形式で保存
-    import shutil
-    import os
-    temp_data = np.load(output_path + '.tmp', mmap_mode='r')
-    np.save(output_path, temp_data)
+    # 一時ファイルをmemmapとして再度開いて.npy形式で保存
+    temp_data = np.memmap(output_path + '.tmp', dtype='float32', mode='r', shape=memmap_shape)
+    np.save(output_path, np.array(temp_data))
     
-    # 一時ファイルを削除
+    # memmapを閉じてから一時ファイルを削除
+    del temp_data
     os.remove(output_path + '.tmp')
     
     # ファイルサイズを表示
@@ -430,16 +434,18 @@ def extract_clip_features(image_dir, output_path, enc_output_layer=-1, batch_siz
     
     print(f"✅ Feature shape: {memmap_features.shape}")
     
+    # メモリマップの形状を保存
+    memmap_shape = memmap_features.shape
+    
     # メモリマップを明示的に削除してファイルを閉じる
     del memmap_features
     
-    # 一時ファイルを読み込んで.npy形式で保存
-    import shutil
-    import os
-    temp_data = np.load(output_path + '.tmp', mmap_mode='r')
-    np.save(output_path, temp_data)
+    # 一時ファイルをmemmapとして再度開いて.npy形式で保存
+    temp_data = np.memmap(output_path + '.tmp', dtype='float32', mode='r', shape=memmap_shape)
+    np.save(output_path, np.array(temp_data))
     
-    # 一時ファイルを削除
+    # memmapを閉じてから一時ファイルを削除
+    del temp_data
     os.remove(output_path + '.tmp')
     
     # ファイルサイズを表示
