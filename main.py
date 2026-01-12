@@ -27,6 +27,24 @@ import os
 from PIL import Image
 Image.warnings.simplefilter('ignore')
 
+# =============================================================
+# このスクリプトについて
+# -------------------------------------------------------------
+# NSD (Natural Scenes Dataset) のfMRI応答を、画像特徴量から予測する
+# 「脳エンコーダ」モデルを学習・評価するエントリポイントです。
+# 主な流れ:
+#  1) 引数の定義とログ/保存先の準備
+#  2) ROIマップの読み込みとデータローダの作成
+#  3) モデル・損失関数・最適化器の構築 (必要ならDDP)
+#  4) エポックループ: 学習 → 検証 (相関で性能算出) → ベスト更新/保存
+#  5) ベスト更新時はテストセットの予測も保存
+#
+# 重要な設計ポイント:
+#  - readout_res/encoder_arch/backbone_arch の組み合わせで出力形状/処理が変化
+#  - ROI単位あるいは頂点(ボクセル)単位での予測/評価に対応
+#  - 'linear'エンコーダのときはL2(リッジ)正則化を付加
+# =============================================================
+
 # np.random.seed(0)
 # torch.manual_seed(0)
 
@@ -38,28 +56,33 @@ except ImportError as e:
 
 
 def get_args_parser():
+    # 引数パーサ: 実験の設定をコマンドラインから制御できるようにします。
+    # 大きく、入出力/NSD設定/特徴量入出力/モデル設定/学習設定/データ拡張/分散設定 で構成。
     parser = argparse.ArgumentParser(description='NSD Training', add_help=False)
 
+    # ========== 共通入出力/再開関連 ==========
     parser.add_argument('--resume', default=None, help='resume from checkpoint')
     parser.add_argument('--output_path', default='./results/', type=str,
                         help='if not none, then store the model resuls')
     
     parser.add_argument('--save_model', default=False, type=int) 
     
-    ## NSD params
+    # ========== NSD データセット関連 ==========
     parser.add_argument('--subj', default=1, type=int) 
     parser.add_argument('--run', default=1, type=int)  
     parser.add_argument('--data_dir', default='../../../algonauts/algonauts_2023_challenge_data/', type=str)
     parser.add_argument('--parent_submission_dir', default='./algonauts_2023_challenge_submission/', type=str)
     
+    # 事前抽出済み特徴量を使う場合の指定
     parser.add_argument('--saved_feats', default=None, type=str) #'dinov2q'
     parser.add_argument('--saved_feats_dir', default='../../algonauts_image_features/', type=str) 
     
+    # 出力解像度(どの単位で予測/評価するか)
     parser.add_argument('--readout_res', choices=['voxels', 'rois_all', 'streams_inc', 'visuals', 'bodies', 'faces', 'places','words',
                                                   'hemis']
                         , default='streams_inc', type=str)   
     
-    # the model for mapping from backbone image features to fMRI
+    # 画像特徴 → fMRI へのマッピングモデル(エンコーダ)の種類
     parser.add_argument('--encoder_arch', choices=['transformer', 'linear', 
                                                     'custom_transformer',
                                                     'spatial_feature'], 
@@ -71,7 +94,7 @@ def get_args_parser():
     parser.add_argument('--dataset', choices=['nsd_algo', 'nsd_gen'],
                         default='nsd_algo', help='which model to train')
     
-    # Backbone
+    # ========== 画像特徴抽出バックボーン ==========
     parser.add_argument('--backbone_arch', choices=[None, 'dinov2', 'dinov2_q', 
                                                     'resnet18', 'resnet50',
                                                     'dinov2_cls', 'dinov2_q_cls',
@@ -87,7 +110,7 @@ def get_args_parser():
     parser.add_argument('--return_interm', default=False,
                         help="Train segmentation head if the flag is provided")
 
-    # * Transformer
+    # ========== Transformer系エンコーダ設定 ==========
     parser.add_argument('--enc_layers', default=0, type=int,
                         help="Number of encoding layers in the transformer brain model")
     parser.add_argument('--dec_layers', default=1, type=int,
@@ -109,7 +132,7 @@ def get_args_parser():
     parser.add_argument('--enc_output_layer', default=1, type=int,
                     help="Specify the encoder layer that provides the encoder output. default is the last layer")
     
-    # training parameters
+    # ========== 学習ハイパーパラメータ ==========
     parser.add_argument('--num_workers', default=4, type=int,
                         help='number of data loading num_workers')
     parser.add_argument('--epochs', default=15, type=int,
@@ -130,7 +153,7 @@ def get_args_parser():
     parser.add_argument('--wandb_p', default=None, type=str)
     parser.add_argument('--wandb_r', default=None, type=str)
 
-    # dataset parameters
+    # ========== データ前処理/拡張 ==========
     parser.add_argument('--image_size', default=None, type=int, 
                         help='what size should the image be resized to?')
     parser.add_argument('--horizontal_flip', default=True,
@@ -139,6 +162,7 @@ def get_args_parser():
     parser.add_argument('--img_channels', default=3, type=int,
                     help="what should the image channels be (not what it is)?") #gray scale 1 / color 3
 
+    # ========== 分散学習設定 ==========
     parser.add_argument('--distributed', default=False,
                         help='whether to use distributed training')
 
@@ -147,6 +171,10 @@ def get_args_parser():
 
 
 class SetCriterion(nn.Module):
+    # 損失関数モジュール:
+    #  - 基本は左右半球(LH/RH)の予測fMRIと正解fMRIのMSE
+    #  - readout_res が ROI 単位の場合は、頂点→ROIへの加重平均で出力を集約
+    #  - encoder_arch が 'linear' のときは L2 正則化(リッジ)を追加
     def __init__(self, lh_challenge_rois, rh_challenge_rois):
         super().__init__()
         self.weight_dict = {'loss_labels': 1}
@@ -175,6 +203,10 @@ class SetCriterion(nn.Module):
         # self.rh_v = args.rh_vs 
 
     def forward(self, outputs, targets):
+        # outputs: モデル出力 (辞書)
+        #  - 'lh_f_pred': (B, V_lh[, R]) 予測LH信号 (RはROI次元のとき)
+        #  - 'rh_f_pred': (B, V_rh[, R]) 予測RH信号
+        # targets: ターゲットfMRI (リストの先頭要素を使用)
 
         assert 'lh_f_pred' in outputs    
         assert 'rh_f_pred' in outputs 
@@ -184,6 +216,8 @@ class SetCriterion(nn.Module):
         
         if (self.encoder_arch != 'linear') and (self.readout_res != 'hemis') and (self.readout_res != 'voxels'):
 
+            # ROIごとのマスク(one-hotに近い重み)をバッチに合わせてタイルし、
+            # 頂点方向に加重和を取って ROI 表現へ集約
             lh_challenge_rois = torch.tile(self.lh_challenge_rois[:,:,None], (1,1,targets['lh_f'].shape[0])).permute(2,1,0)
             rh_challenge_rois = torch.tile(self.rh_challenge_rois[:,:,None], (1,1,targets['rh_f'].shape[0])).permute(2,1,0)
             
@@ -192,12 +226,15 @@ class SetCriterion(nn.Module):
 
             if (self.readout_res != 'streams_inc') and (self.readout_res != 'rois_all'):
 
+                # 注意: 下記の lh_rois/rh_rois は外部で定義されていることを仮定
+                # (このスコープでは未定義。読み出し解像度によっては上流で渡す必要あり)
                 outputs['lh_f_pred'] = (1*(lh_rois>0)) * outputs['lh_f_pred']
                 outputs['rh_f_pred'] = (1*(rh_rois>0)) * outputs['rh_f_pred']
 
                 targets['lh_f'] = (1*(lh_rois>0)) * targets['lh_f']
                 targets['rh_f'] = (1*(rh_rois>0)) * targets['rh_f']
         
+        # LH/RH それぞれのMSEを計算して合算
         loss_lh = nn.MSELoss()(outputs['lh_f_pred'], targets['lh_f'])
         loss_rh = nn.MSELoss()(outputs['rh_f_pred'], targets['rh_f'])
         #losses = {'loss_mse_fmri': loss_lh+loss_rh}
@@ -207,6 +244,7 @@ class SetCriterion(nn.Module):
         # add a ridge penalty to the linear model
         if 'cls' not in self.backbone_arch:
             if self.encoder_arch == 'linear':
+                # 線形エンコーダの場合はL2正則化を追加(過学習抑制)
                 loss = loss + 0.02* outputs['l2_reg']
 
         losses = {'loss_labels': loss}
@@ -214,6 +252,7 @@ class SetCriterion(nn.Module):
     
 
 def main(rank, world_size, args):
+    # 学習/検証/保存のメインルーチン。分散/単GPUどちらにも対応。
 
     if args.distributed:
         args.rank = rank
@@ -230,6 +269,7 @@ def main(rank, world_size, args):
     args.subj = format(args.subj, '02')
     args.data_dir = os.path.join(args.data_dir, 'subj'+ args.subj)
     
+    # 結果保存ディレクトリの用意
     if args.output_path:
         args.save_dir = args.output_path + f'nsd_test/{args.backbone_arch}_{args.encoder_arch}/subj_{args.subj}/{args.readout_res}/enc_{args.enc_output_layer}/run_{args.run}/'
         if (not os.path.exists(args.save_dir)) and (args.gpu == 0):
@@ -237,6 +277,7 @@ def main(rank, world_size, args):
 
     if args.dataset == 'nsd_algo':
 
+        # ROIマップ/マスクの読み込みと、読み出し解像度に応じた頂点数・クエリ数の決定
         roi_name_maps, lh_challenge_rois, rh_challenge_rois = roi_maps(args.data_dir)
         lh_challenge_rois_s, rh_challenge_rois_s, lh_roi_names, rh_roi_names, num_queries \
             = roi_masks(args.readout_res, roi_name_maps, lh_challenge_rois, rh_challenge_rois)
@@ -254,12 +295,14 @@ def main(rank, world_size, args):
         args.lh_vs = lh_challenge_rois_s.shape[1]
         args.rh_vs = rh_challenge_rois_s.shape[1]   
 
+        # データローダを作成 (train/val/test)
         #train_loader, val_loader = fetch_data_loaders(args)
         train_loader, val_loader = fetch_dataloaders(args, train='train')
         test_loader = fetch_dataloaders(args, train='test')
 
     elif args.dataset == 'nsd_gen':
         
+        # 生成系設定(別データパス/メタデータからROIマスク取得)
         args.hemi = 'lh'
         args.data_dir = "/engram/nklab/datasets/natural_scene_dataset/model_training_datasets/neural_data"
         args.imgs_dir = "/engram/nklab/datasets/natural_scene_dataset/nsddata_stimuli/stimuli/nsd"
@@ -288,6 +331,7 @@ def main(rank, world_size, args):
         args.lh_vs = betas['lh'].shape[1]
         args.rh_vs = betas['rh'].shape[1]
 
+    # モデルの構築 (画像特徴→fMRI 予測器)
     model = brain_encoder(args) #get_model(args)
     model = model.cuda() 
     num_parameters =  sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -296,6 +340,7 @@ def main(rank, world_size, args):
 
     model_ddp = model
     if args.distributed:
+        # 分散学習ラッパ (未使用パラメータの存在も許容)
         model_ddp = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], 
                                                               find_unused_parameters=True)
         
@@ -303,6 +348,7 @@ def main(rank, world_size, args):
     
     
     if args.resume:
+        # チェックポイントから再開: モデル/最適化器/スケジューラ/エポックを復元
         checkpoint = torch.load(args.resume, map_location='cpu')
         pretrained_dict = checkpoint['model']
         model.load_state_dict(pretrained_dict)
@@ -324,6 +370,7 @@ def main(rank, world_size, args):
             
     else:
         
+        # 新規学習: 学習対象パラメータの収集と最適化器/スケジューラの初期化
         param_dicts = [ 
             { "params" : [ p for n , p in model.named_parameters() if p.requires_grad]}, ]  #n not in frozen_params and 
     
@@ -337,7 +384,7 @@ def main(rank, world_size, args):
 
         args.start_epoch = 0
 
-    # only for one processs
+    # ログやW&Bはrank==0 (単一GPU時)のみで実行
     if args.gpu == 0: 
         if args.wandb_p:
             os.environ['WANDB_MODE'] = 'online'
@@ -373,16 +420,17 @@ def main(rank, world_size, args):
     start_time = time.time()
     
     for epoch in range(args.start_epoch, args.epochs):
-            
+        # ========== 学習 ==========
         train_stats = train_one_epoch(
             model_ddp, criterion, train_loader, optimizer, args.device, epoch,
             args.clip_max_norm)
         lr_scheduler.step()
 
 
-        # evaluate
+        # ========== 検証: 予測/損失/可視化用の値を取得 ==========
         lh_fmri_val_pred, rh_fmri_val_pred, lh_fmri_val, rh_fmri_val, val_loss = evaluate(model, criterion, val_loader, args, lh_challenge_rois_s, rh_challenge_rois_s)
 
+        # LH/RH 各頂点ごとにピアソン相関を計算
         # Empty correlation array of shape: (LH vertices)
         lh_correlation = np.zeros(lh_fmri_val_pred.shape[1])
         # Correlate each predicted LH vertex with the corresponding ground truth vertex
@@ -395,7 +443,7 @@ def main(rank, world_size, args):
         for v in tqdm(range(rh_fmri_val_pred.shape[1])):
             rh_correlation[v] = corr(rh_fmri_val_pred[:,v], rh_fmri_val[:,v])[0]
 
-        # Select the correlation results vertices of each ROI
+        # ROIごとに対応する頂点の相関リストを作成
         roi_names = []
         lh_roi_correlation = []
         rh_roi_correlation = []
@@ -412,7 +460,7 @@ def main(rank, world_size, args):
         rh_roi_correlation.append(rh_correlation)
 
 
-        # Create the plot
+        # ROIごとの平均相関と、全頂点の平均相関を算出
         lh_mean_roi_correlation = [np.mean(np.nan_to_num(np.array(lh_roi_correlation[r]), copy=True, nan=0.0, posinf=None, neginf=None))
             for r in range(len(lh_roi_correlation))]
         rh_mean_roi_correlation = [np.mean(np.nan_to_num(np.array(rh_roi_correlation[r]), copy=True, nan=0.0, posinf=None, neginf=None))
@@ -423,6 +471,7 @@ def main(rank, world_size, args):
         print('val_perf:', val_perf) 
         print('shape of rh_fmri_val_pred', rh_fmri_val_pred.shape)
         if (args.gpu == 0) and (args.wandb_p): 
+            # W&Bへ全体性能とROIクラスタの平均相関を記録
             wandb_log = {"val_perf": val_perf}
             roi_clusters = {'visuals':np.arange(0,7), 'bodies': np.arange(7,11), 'faces':np.arange(11,16), 'places':np.arange(16,19),'words':np.arange(19,24)}
             for r in roi_clusters.keys():
@@ -439,6 +488,7 @@ def main(rank, world_size, args):
                             f.write(f'epoch {epoch}, val_perf: {val_perf} \n') 
 
                 if args.save_model:
+                    # ベスト更新時にチェックポイント(バックボーン抜き)を保存
                     checkpoint_paths = [args.save_dir + '/checkpoint.pth']
 
                     model_state_dict = model.state_dict()
@@ -465,6 +515,7 @@ def main(rank, world_size, args):
                 np.save(args.save_dir+'lh_val_corr.npy', lh_correlation)
                 np.save(args.save_dir+'rh_val_corr.npy', rh_correlation)
 
+        # ベスト更新時にテストセットも予測し保存
                 lh_fmri_test_pred, rh_fmri_test_pred = test(model, criterion, test_loader, args, lh_challenge_rois_s, rh_challenge_rois_s)
 
                 lh_fmri_test_pred = lh_fmri_test_pred.astype(np.float32)
@@ -474,10 +525,12 @@ def main(rank, world_size, args):
                 np.save(args.save_dir+'/rh_pred_test.npy', rh_fmri_test_pred)
 
     if args.distributed:
+    # 分散プロセスのクリーンアップ
         destroy_process_group()
 
 
 if __name__ == '__main__':
+    # 引数を解析してメインを実行。出力パスがあれば事前に作成。
     parser = argparse.ArgumentParser('model training and evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
     if args.output_path:
